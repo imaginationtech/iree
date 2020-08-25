@@ -676,7 +676,7 @@ static LogicalResult linalgCopyTileAndDistribute(
     ConversionPatternRewriter &rewriter) {
   linalg::LinalgTilingOptions options;
   // Tile to memory access of 128bits as those tend to be optimal on most GPUs.
-  constexpr unsigned vecLoadBits = 128;
+  constexpr unsigned vecLoadBits = 32; //128;
   unsigned elementBits =
       copyOp.getSource().getType().cast<MemRefType>().getElementTypeBitWidth();
   if (elementBits == 0 || vecLoadBits % elementBits != 0) return failure();

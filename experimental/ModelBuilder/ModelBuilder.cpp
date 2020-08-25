@@ -95,6 +95,7 @@ static spirv::TargetEnvAttr getTargetEnv(MLIRContext *context) {
   auto triple = spirv::VerCapExtAttr::get(
       spirv::Version::V_1_0,
       {spirv::Capability::Shader, spirv::Capability::CooperativeMatrixNV,
+       spirv::Capability::StorageUniform16,
        spirv::Capability::Int8, spirv::Capability::Float16,
        spirv::Capability::StorageBuffer8BitAccess,
        spirv::Capability::Float16Buffer},

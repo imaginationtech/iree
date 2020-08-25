@@ -146,6 +146,66 @@ class VectorTransferWriteConversion
   }
 };
 
+
+// Convert degenerated vectors to scalar.
+class VectorTransferReadConversionScalar
+    : public VectorToGPUPattern<vector::TransferReadOp> {
+ public:
+  using VectorToGPUPattern<vector::TransferReadOp>::VectorToGPUPattern;
+
+  LogicalResult matchAndRewrite(
+      vector::TransferReadOp op, ArrayRef<Value> operands,
+      ConversionPatternRewriter &rewriter) const override {
+    if (op.getVectorType().getNumElements() != 1)
+      return failure();
+    auto loc = op.getLoc();
+    Value newOp = rewriter.create<LoadOp>(loc, op.memref(), op.indices());
+    rewriter.replaceOp(op, newOp);
+    return success();
+  }
+};
+
+class VectorTransferWriteConversionScalar
+    : public VectorToGPUPattern<vector::TransferWriteOp> {
+ public:
+  using VectorToGPUPattern<vector::TransferWriteOp>::VectorToGPUPattern;
+
+  LogicalResult matchAndRewrite(
+      vector::TransferWriteOp op, ArrayRef<Value> operands,
+      ConversionPatternRewriter &rewriter) const override {
+
+    if (op.getVectorType().getNumElements() != 1)
+      return failure();
+    StoreOp::Adaptor adaptor(operands);
+    auto loc = op.getLoc();
+    rewriter.create<StoreOp>(loc, operands[0], operands[1],
+                             op.indices());
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+class VectorContractScalar
+    : public VectorToGPUPattern<vector::ContractionOp> {
+ public:
+  using VectorToGPUPattern<vector::ContractionOp>::VectorToGPUPattern;
+
+  LogicalResult matchAndRewrite(
+      vector::ContractionOp op, ArrayRef<Value> operands,
+      ConversionPatternRewriter &rewriter) const override {
+
+    if (op.getAccType().cast<VectorType>().getNumElements() != 1)
+      return failure();
+    vector::ContractionOp::Adaptor adaptor(operands);
+    auto loc = op.getLoc();
+
+    Value newOp = rewriter.create<MulFOp>(loc, adaptor.lhs(), adaptor.rhs());
+    newOp = rewriter.create<AddFOp>(loc, newOp, adaptor.acc());
+    rewriter.replaceOp(op, newOp);
+    return success();
+  }
+};
+
 class VectorToGPUConversionTarget : public ConversionTarget {
  public:
   using ConversionTarget::ConversionTarget;
@@ -202,9 +262,15 @@ void ConvertVectorToGPUPass::runOnOperation() {
 
   auto &cooperativeMatrixAnalysis = getAnalysis<CooperativeMatrixAnalysis>();
   OwningRewritePatternList patterns;
-  patterns.insert<UnaryAndBinaryOpPattern<AddFOp>, VectorTransferReadConversion,
-                  VectorTransferWriteConversion>(context,
-                                                 cooperativeMatrixAnalysis);
+  // patterns.insert<UnaryAndBinaryOpPattern<AddFOp>, VectorTransferReadConversion,
+  //                 VectorTransferWriteConversion>(context,
+  //                                                cooperativeMatrixAnalysis);
+  patterns
+      .insert<UnaryAndBinaryOpPattern<AddFOp>, VectorTransferReadConversion,
+              VectorTransferWriteConversion, VectorTransferReadConversionScalar,
+              VectorTransferWriteConversionScalar, VectorContractScalar>(
+          context, cooperativeMatrixAnalysis);
+
   std::unique_ptr<VectorToGPUConversionTarget> target =
       std::make_unique<VectorToGPUConversionTarget>(*context);
   target->addDynamicallyLegalDialect<StandardOpsDialect>();

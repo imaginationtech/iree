@@ -161,7 +161,9 @@ static bool EqualOrClose(T a, T b) {
   return a == b;
 }
 
-constexpr int TileM = 32, TileN = 32, TileK = 4;
+constexpr int TileM = 16, TileN = 16, TileK = 8;
+//constexpr int TileM = 8, TileN = 8, TileK = 4;
+//constexpr int TileM = 32, TileN = 32, TileK = 4;
 //constexpr int TileM = 4, TileN = 4, TileK = 2;
 
 template <typename SrcT, typename DstT>
@@ -232,8 +234,7 @@ static void matMul(int m, int n, int k, int tileM, int tileN, int tileK,
                 .setTileSizes({tileM, tileN, tileK})
                 .setInterchange({1, 0, 2})
                 .setDistributionOptions(WGDistribute))
-        .setHoistInvariantCode(enableLICM);
-    //if (useWorkgroupMemory) {
+        .setHoistInvariantCode(true);
       strategy
           .promote<linalg::MatmulOp>(
               linalg::LinalgPromotionOptions()
@@ -244,26 +245,26 @@ static void matMul(int m, int n, int k, int tileM, int tileN, int tileK,
                                    mlir::iree_compiler::copyToWorkgroupMemory)
                   // 0: A, 1: B, 2: C
                   // 2 = 0 x 1
+                  //.setOperandsToPromote({0, 1})
                   .setOperandsToPromote({1})
                   //.setOperandsToPromote({0, 1}) // nv. 540 ms
                   //.setOperandsToPromote({0, 1, 2}) // nv. 154 ms
                   .setUseFullTileBuffers({false, false}))
           ;
-    //}
     strategy
         .tile<linalg::MatmulOp>(
             linalg::LinalgTilingOptions()
                 .setLoopType(linalg::LinalgTilingLoopType::ParallelLoops)
-                .setTileSizes({1, tileN, 1})
-                //.setTileSizes({1, tileN, tileK})
+                //.setTileSizes({1, tileN, 1})
+                .setTileSizes({1, tileN, tileK})
                 //.setTileSizes({tileM, tileN, tileK})
                 .setDistributionOptions(WIDistribute));
-    strategy
-        .tile<linalg::MatmulOp>(
-            linalg::LinalgTilingOptions()
-                .setLoopType(linalg::LinalgTilingLoopType::Loops)
-                .setTileSizes({1, 8, 1})
-                );
+    // strategy
+    //     .tile<linalg::MatmulOp>(
+    //         linalg::LinalgTilingOptions()
+    //             .setLoopType(linalg::LinalgTilingLoopType::Loops)
+    //             .setTileSizes({1, 8, 1})
+    //             );
 
     strategy.vectorize<linalg::MatmulOp>().unrollVector<vector::ContractionOp>(
         nativeSize);

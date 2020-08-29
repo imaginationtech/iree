@@ -12,4 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+add_definitions(-DDEBUG)
+add_compile_options(-O0)
+add_compile_options(-g)
+
 iree_add_all_subdirs()

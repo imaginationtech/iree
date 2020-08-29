@@ -26,6 +26,7 @@
 #include "iree/compiler/Conversion/LinalgToSPIRV/CooperativeMatrixAnalysis.h"
 #include "iree/compiler/Conversion/LinalgToSPIRV/MarkerUtils.h"
 #include "iree/compiler/Conversion/LinalgToSPIRV/Passes.h"
+#include "iree/compiler/Dialect/Flow/IR/FlowOpUtils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "mlir/Dialect/GPU/GPUDialect.h"
@@ -55,6 +56,7 @@ struct ConvertVectorToGPUPass
 
  private:
   void tileAndVectorizeLinalgCopy(FuncOp funcOp, MLIRContext *context);
+  void imgHackConvertForOpResultToF32(FuncOp funcOp, MLIRContext *context);
 };
 
 // Common class for all vector to GPU patterns.
@@ -161,9 +163,87 @@ class VectorTransferReadConversionScalar
     auto loc = op.getLoc();
     Value newOp = rewriter.create<LoadOp>(loc, op.memref(), op.indices());
     rewriter.replaceOp(op, newOp);
+
+    scf::ForOp loop;
+    unsigned argNo;
+    for (auto &use : op.vector().getUses()) {
+      loop = dyn_cast<scf::ForOp>(use.getOwner());
+      if (loop) {
+        argNo = use.getOperandNumber() - 3;
+        break;
+      }
+    }
+
+    if (loop) {
+      //llvm::errs() << "==== dump region ===\n";
+      //loop.region();
+      llvm::errs() << "==== modify block argument [" << argNo + 1 << "] type from ";
+      loop.region().front().getArgument(argNo + 1).getType().dump();
+      llvm::errs() << " to ";
+      newOp.getType().dump();
+      llvm::errs() << "\n";
+      //LoadOp newLoadOp = dyn_cast<LoadOp>(newOp.getDefiningOp());
+      // int i = 0;
+      // for (Value arg : loop.initArgs()) {
+      //   if (i == argNo) {
+      //     arg.replaceAllUsesWith(newLoadOp.result());
+      //     break;
+      //   }
+      //   ++i;
+      // }
+      //BlockArgument newArg = loop.region().front().insertArgument(argNo + 1, newOp.getType());
+
+      // llvm::errs() << "its users:\n";
+      // for (auto &use : loop.region().front().getArgument(argNo + 1).getUses()) {
+      //   llvm::errs() << "  * ";
+      //   use.getOwner()->dump();
+      // }
+
+      // directly set type:
+      // loop.region().front().getArgument(argNo + 1).setType(newOp.getType());
+
+      // replace with new type:
+      //loop.region().front().addArgument(newOp.getType());
+      BlockArgument newArg = loop.getBody()->insertArgument(argNo + 1, newOp.getType());
+        //loop.getBody()->addArgument(newOp.getType());
+
+      //loop.region().front().getArgument(argNo + 1).replaceAllUsesWith(newArg);
+      loop.getBody()->getArgument(argNo + 2).replaceAllUsesWith(newArg);
+      loop.getBody()->eraseArgument(argNo + 2);
+      llvm::errs() << "number args = " << loop.getBody()->getNumArguments() << "\n";
+
+      llvm::errs() << "newArg users:\n";
+      for (auto &use : newArg.getUses()) {
+        llvm::errs() << "  * ";
+        use.getOwner()->dump();
+      }
+
+      //loop.region().front().getArgument(argNo + 2).replaceAllUsesWith(newArg);
+      //loop.region().front().dump();
+      //loop.initArgsMutable();
+      //loop.region().front().eraseArgument(argNo + 2);
+      //auto newArgs = loop.initArgs();
+      //newArgs[argNo].
+      //newArgs[argNo] = newLoadOp.result();
+      //loop.initArgsMutable().assign(newArgs);
+      //loop.region().front().dump();
+      //loop.initArgsMutable().clear();
+      //loop.region().front().getArgument(argNo).setType(newOp.getType());
+
+      // debug dump
+      // llvm::errs() << "\nblock dumps:\n\n";
+      // loop.getBody()->dump();
+
+      // llvm::errs() << "\nfunc dumps:\n\n";
+      // loop.getParentRegion()->front().dump();
+    }
+
     return success();
   }
 };
+
+// user -> new value
+std::map<Operation *, Value> loopResultUserMap;
 
 class VectorTransferWriteConversionScalar
     : public VectorToGPUPattern<vector::TransferWriteOp> {
@@ -178,7 +258,18 @@ class VectorTransferWriteConversionScalar
       return failure();
     StoreOp::Adaptor adaptor(operands);
     auto loc = op.getLoc();
-    rewriter.create<StoreOp>(loc, operands[0], operands[1],
+
+    llvm::errs() << "repalce write op: ";
+    op.dump();
+    llvm::errs() << "\n";
+    Value operand0 = operands[0];
+    if (loopResultUserMap.find(op.getOperation()) != loopResultUserMap.end()) {
+      loopResultUserMap[op.getOperation()].dump();
+      operand0 = loopResultUserMap[op.getOperation()];
+    }
+
+    rewriter.create<StoreOp>(loc, operand0, //operands[0],
+                             operands[1],
                              op.indices());
     rewriter.eraseOp(op);
     return success();
@@ -194,8 +285,10 @@ class VectorContractScalar
       vector::ContractionOp op, ArrayRef<Value> operands,
       ConversionPatternRewriter &rewriter) const override {
 
-    if (op.getAccType().cast<VectorType>().getNumElements() != 1)
-      return failure();
+    llvm::errs() << " ====== op.getAccType().dump() ==== \n";
+    //op.getAccType().dump();
+    //if (op.getAccType().cast<VectorType>().getNumElements() != 1)
+    //  return failure();
     vector::ContractionOp::Adaptor adaptor(operands);
     auto loc = op.getLoc();
 
@@ -255,10 +348,80 @@ void ConvertVectorToGPUPass::tileAndVectorizeLinalgCopy(FuncOp funcOp,
   applyPatternsAndFoldGreedily(funcOp, vectorizationPatterns);
 }
 
+static Operation *cloneWithNewResultTypes(Operation *op, TypeRange newResultTypes) {
+  OperationState state(op->getLoc(), op->getName());
+  state.addOperands(op->getOperands());
+  state.addTypes(newResultTypes);
+  state.addSuccessors(op->getSuccessors());
+  state.addAttributes(op->getAttrs());
+  for (unsigned i = 0, e = op->getNumRegions(); i < e; ++i) {
+    state.addRegion();
+  }
+  Operation *newOp = Operation::create(state);
+  for (unsigned i = 0, e = op->getNumRegions(); i < e; ++i) {
+    newOp->getRegion(i).takeBody(op->getRegion(i));
+  }
+  return newOp;
+}
+
+void ConvertVectorToGPUPass::imgHackConvertForOpResultToF32(FuncOp funcOp, MLIRContext *ctx) {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    funcOp.walk([&](Operation *op) {
+      auto loop = dyn_cast<scf::ForOp>(op);
+
+      if (!loop || loop.getNumResults() == 0 || loop.getResult(0).getType() == FloatType::getF32(ctx))
+        return WalkResult::advance();
+
+      llvm::SmallVector<Type, 4> newResultTypes;
+      for (unsigned i = 0; i < loop.getNumResults(); ++i)
+        newResultTypes.push_back(FloatType::getF32(ctx));
+
+      OpBuilder builder(loop);
+      auto newloop = cloneWithNewResultTypes(loop, newResultTypes);
+      builder.insert(newloop);
+
+  auto &loopBody = *loop.getBody();
+  auto &newLoopBody = *dyn_cast<scf::ForOp>(newloop).getBody();
+  // auto yield = cast<scf::YieldOp>(loopBody.getTerminator());
+  // auto yieldOperands = llvm::to_vector<4>(yield.getOperands());
+  // auto newYield = cast<scf::YieldOp>(newLoopBody.getTerminator());
+
+      // for (unsigned i = 0; i < loop.getNumResults(); ++i)
+      //   loop.getResult(i).replaceAllUsesWith(newloop->getResult(i));
+      unsigned i = 0;
+      for (OpResult result : loop.getResults()) {
+        for (auto &use : result.getUses()) {
+          llvm::errs() << "=== new result type ==\n";
+          //newloop->getResult(i).dump();
+          //result.dump();
+          loopResultUserMap[use.getOwner()] = newloop->getResult(i);
+          //use.set(newloop->getResult(i));
+        }
+        ++i;
+      }
+      // llvm::errs() << "=== loopBody.getTerminator()->dump(); ==\n";
+      // loopBody.getTerminator()->dump();
+      llvm::errs() << "=== newLoopBody.getTerminator()->dump(); ==\n";
+      newLoopBody.getTerminator()->dump();
+      loop.erase();
+      llvm::errs() << "=== newLoopBody.getTerminator()->dump(); ==\n";
+      newLoopBody.getTerminator()->dump();
+
+      changed = true;
+      return WalkResult::interrupt();
+    });
+  }
+  llvm::errs() << "=== rewrite output type ==\n";
+  funcOp.dump();
+}
+
 void ConvertVectorToGPUPass::runOnOperation() {
   MLIRContext *context = &getContext();
   FuncOp funcOp = getOperation();
   tileAndVectorizeLinalgCopy(funcOp, context);
+  imgHackConvertForOpResultToF32(funcOp, context);
 
   auto &cooperativeMatrixAnalysis = getAnalysis<CooperativeMatrixAnalysis>();
   OwningRewritePatternList patterns;

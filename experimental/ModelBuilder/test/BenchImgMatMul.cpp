@@ -69,6 +69,14 @@ static llvm::cl::opt<bool> enableLICM(
     llvm::cl::desc("Enable loop invariant hoisting optimizations"),
     llvm::cl::value_desc("boolean"), llvm::cl::init(false));
 
+static llvm::cl::list<int> tileSize(
+    "tile-size", llvm::cl::desc("Specify tile size for m n k."),
+    llvm::cl::CommaSeparated);
+
+static llvm::cl::opt<bool> promoteA("promote-a",
+                                    llvm::cl::desc("Promote matrix A as well."),
+                                    llvm::cl::init(false));
+
 static void addLoweringPasses(mlir::PassManager &pm,
                               llvm::ArrayRef<int64_t> numWorkgroups,
                               llvm::ArrayRef<Type> args) {
@@ -130,6 +138,27 @@ static SmallVector<linalg::ProcInfo, 2> getGpuProcIds(
   return procInfo;
 }
 
+static linalg::ProcInfoCallBackFn getGpuProcIds(int tileN) {
+  switch (tileN) {
+    case 2:
+      return getGpuProcIds<gpu::ThreadIdOp, 2>;
+    case 4:
+      return getGpuProcIds<gpu::ThreadIdOp, 4>;
+    case 8:
+      return getGpuProcIds<gpu::ThreadIdOp, 8>;
+    case 16:
+      return getGpuProcIds<gpu::ThreadIdOp, 16>;
+    case 32:
+      return getGpuProcIds<gpu::ThreadIdOp, 32>;
+    case 64:
+      return getGpuProcIds<gpu::ThreadIdOp, 64>;
+    case 128:
+      return getGpuProcIds<gpu::ThreadIdOp, 128>;
+    default:
+      llvm_unreachable("unsupported tileN size.");
+  }
+}
+
 struct MatMulF32 {
   using Type = float;
   static mlir::Type getMLIRType(MLIRContext &ctx) {
@@ -156,20 +185,43 @@ static T getMatB(unsigned idx) {
 
 template <typename T>
 static bool EqualOrClose(T a, T b) {
-  if (std::is_same<T, float>::value)
-    return fabs((float)a - (float)b) < 0.1f;
+  if (std::is_same<T, float>::value) return fabs((float)a - (float)b) < 0.1f;
   return a == b;
 }
 
-constexpr int TileM = 16, TileN = 16, TileK = 8;
-//constexpr int TileM = 8, TileN = 8, TileK = 4;
-//constexpr int TileM = 32, TileN = 32, TileK = 4;
-//constexpr int TileM = 4, TileN = 4, TileK = 2;
+// constexpr int TileM = 16, TileN = 16, TileK = 8;
+// constexpr int TileM = 8, TileN = 8, TileK = 4;
+// constexpr int TileM = 32, TileN = 32, TileK = 16;
+// constexpr int TileM = 32, TileN = 32, TileK = 4;
+// constexpr int TileM = 4, TileN = 4, TileK = 2;
+template <uint32_t TileRowSize, uint32_t TileColSize, uint32_t TileStepSize,
+          class T>
+struct optimized {
+  static void matmul(T c, const T a, const T b, unsigned row_size,
+                     unsigned col_size, unsigned reduction_size) {
+    for (uint32_t i = 0; i < row_size; i += TileRowSize)
+      for (uint32_t j = 0; j < col_size; j += TileColSize)
+        for (uint32_t k = 0; k < reduction_size; k += TileStepSize) {
+          // T localB[TileStepSize][TileColSize];
+          // for (uint32_t tk = k; tk < k + TileStepSize; ++tk)
+          //   for (uint32_t tj = j; tj < j + TileColSize; ++tj)
+          //     localB[tk - k][tj - j] = b.at(tk, tj);
+          // T localA[TileRowSize][TileStepSize];
+          // for (uint32_t ti = i; ti < i + TileRowSize; ++ti)
+          //   for (uint32_t tk = k; tk < k + TileStepSize; ++tk)
+          //     localA[ti - i][tk - k] = a.at(ti, tk);
+          for (uint32_t tk = k; tk < k + TileStepSize; ++tk)
+            for (uint32_t ti = i; ti < i + TileRowSize; ++ti)
+              for (uint32_t tj = j; tj < j + TileColSize; ++tj)
+                (*c)[ti][tj] += (*a)[ti][tk] * (*b)[tk][tj];
+        }
+  }
+};
 
 template <typename SrcT, typename DstT>
 static void matMul(int m, int n, int k, int tileM, int tileN, int tileK,
                    const std::array<int64_t, 3> &nativeSize, bool correctness) {
-  const int warpSize = TileM;
+  const int warpSize = tileM;
   const int resRows = m;
   const int resColumns = n;
   const int reductionSize = k;
@@ -223,9 +275,14 @@ static void matMul(int m, int n, int k, int tileM, int tileN, int tileK,
 
     linalg::LinalgLoopDistributionOptions WIDistribute;
     WIDistribute.distributionMethod = {
-      linalg::DistributionMethod::CyclicNumProcsEqNumIters,
-      linalg::DistributionMethod::CyclicNumProcsEqNumIters};
-    WIDistribute.procInfo = getGpuProcIds<gpu::ThreadIdOp, TileN>;
+        linalg::DistributionMethod::CyclicNumProcsEqNumIters,
+        linalg::DistributionMethod::CyclicNumProcsEqNumIters};
+    WIDistribute.procInfo = getGpuProcIds(tileM);
+
+    SmallVector<int64_t, 2> promotionList;
+    // promote matrix B
+    promotionList.push_back(1);
+    if (promoteA) promotionList.push_back(0);
 
     strategy
         .tile<linalg::MatmulOp>(
@@ -235,36 +292,23 @@ static void matMul(int m, int n, int k, int tileM, int tileN, int tileK,
                 .setInterchange({1, 0, 2})
                 .setDistributionOptions(WGDistribute))
         .setHoistInvariantCode(true);
-      strategy
-          .promote<linalg::MatmulOp>(
-              linalg::LinalgPromotionOptions()
-                  .setAllocationDeallocationFns(
-                      mlir::iree_compiler::allocateWorkgroupMemory,
-                      mlir::iree_compiler::deallocateWorkgroupMemory)
-                  .setCopyInOutFns(mlir::iree_compiler::copyToWorkgroupMemory,
-                                   mlir::iree_compiler::copyToWorkgroupMemory)
-                  // 0: A, 1: B, 2: C
-                  // 2 = 0 x 1
-                  //.setOperandsToPromote({0, 1})
-                  .setOperandsToPromote({1})
-                  //.setOperandsToPromote({0, 1}) // nv. 540 ms
-                  //.setOperandsToPromote({0, 1, 2}) // nv. 154 ms
-                  .setUseFullTileBuffers({false, false}))
-          ;
-    strategy
-        .tile<linalg::MatmulOp>(
-            linalg::LinalgTilingOptions()
-                .setLoopType(linalg::LinalgTilingLoopType::ParallelLoops)
-                //.setTileSizes({1, tileN, 1})
-                .setTileSizes({1, tileN, tileK})
-                //.setTileSizes({tileM, tileN, tileK})
-                .setDistributionOptions(WIDistribute));
-    // strategy
-    //     .tile<linalg::MatmulOp>(
-    //         linalg::LinalgTilingOptions()
-    //             .setLoopType(linalg::LinalgTilingLoopType::Loops)
-    //             .setTileSizes({1, 8, 1})
-    //             );
+    strategy.promote<linalg::MatmulOp>(
+        linalg::LinalgPromotionOptions()
+            .setAllocationDeallocationFns(
+                mlir::iree_compiler::allocateWorkgroupMemory,
+                mlir::iree_compiler::deallocateWorkgroupMemory)
+            .setCopyInOutFns(mlir::iree_compiler::copyToWorkgroupMemory,
+                             mlir::iree_compiler::copyToWorkgroupMemory)
+            // 0: A, 1: B, 2: C
+            // 2 = 0 x 1
+            //.setOperandsToPromote({1})
+            .setOperandsToPromote(promotionList)
+            .setUseFullTileBuffers({false, false}));
+    strategy.tile<linalg::MatmulOp>(
+        linalg::LinalgTilingOptions()
+            .setLoopType(linalg::LinalgTilingLoopType::ParallelLoops)
+            .setTileSizes({1, tileN, tileK})
+            .setDistributionOptions(WIDistribute));
 
     strategy.vectorize<linalg::MatmulOp>().unrollVector<vector::ContractionOp>(
         nativeSize);
@@ -295,17 +339,19 @@ static void matMul(int m, int n, int k, int tileM, int tileN, int tileK,
 
   // Is checking corretness compare to the value computed on CPU.
   if (correctness) {
-    for (int i = 0; i < resRows; i++) {
-      for (int j = 0; j < resColumns; j++) {
-        typename DstT::Type acc = (*C)[i][j];
-        for (int k = 0; k < reductionSize; k++) {
-          typename DstT::Type a = (*A)[i][k];
-          typename DstT::Type b = (*B)[k][j];
-          acc += a * b;
-        }
-        (*CPURes)[i][j] = acc;
-      }
-    }
+    // for (int i = 0; i < resRows; i++) {
+    //   for (int j = 0; j < resColumns; j++) {
+    //     typename DstT::Type acc = (*C)[i][j];
+    //     for (int k = 0; k < reductionSize; k++) {
+    //       typename DstT::Type a = (*A)[i][k];
+    //       typename DstT::Type b = (*B)[k][j];
+    //       acc += a * b;
+    //     }
+    //     (*CPURes)[i][j] = acc;
+    //   }
+    //}
+    optimized<32, 32, 8, decltype(A.get())>::matmul(
+        CPURes.get(), A.get(), B.get(), resRows, resColumns, reductionSize);
   }
 
   // 4. Call the funcOp named `funcName`.
@@ -325,10 +371,11 @@ static void matMul(int m, int n, int k, int tileM, int tileN, int tileK,
         }
       }
     }
-    if (correct) printf("pass\n");
+    if (correct)
+      printf("pass\n");
     else {
       llvm::errs() << "mismatch count = " << errcnt << " ("
-                   << (float)errcnt / (resRows*resColumns) << "%)\n";
+                   << (float)errcnt / (resRows * resColumns) << "%)\n";
     }
   }
 }
@@ -348,15 +395,22 @@ int main(int argc, char **argv) {
   // test specific option for a runtime support library.
   llvm::InitLLVM y(argc, argv);
   llvm::cl::ParseCommandLineOptions(argc, argv, "BenchMatMulVectorGPU\n");
-  int m = 4096/4;
-  int n = 4096/4;
-  int k = 4096/4;
+  int m = 4096 / 4;
+  int n = 4096 / 4;
+  int k = 4096 / 4;
   if (correctness) {
     // m = 256;
     // n = 256;
     // k = 256;
   }
-  printf("Matrix size: %ix%ix%i\n", m, n, k);
-  matMul(m, n, k, TileM, TileN, TileK, correctness);
+  SmallVector<int, 4> vTileSize(tileSize.begin(), tileSize.end());
+  int tiles[3] = {32, 32, 4};
+  for (unsigned i = 0; i < tileSize.size() && i < 3; ++i) {
+    tiles[i] = tileSize[i];
+  }
+
+  printf("Matrix size: %ix%ix%i, tile size: %ix%ix%i, ", m, n, k, tiles[0],
+         tiles[1], tiles[2]);
+  matMul(m, n, k, tiles[0], tiles[1], tiles[2], correctness);
   return 0;
 }
